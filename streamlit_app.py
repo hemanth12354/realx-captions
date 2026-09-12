@@ -89,7 +89,7 @@ def analyze_reference_style(api_key: str, frame_path: str) -> dict:
     )
 
     response = client.models.generate_content(
-        model="model="gemini-3.6-flash",
+        model="gemini-3.6-flash",
         contents=[prompt, types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")],
     )
 
