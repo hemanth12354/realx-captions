@@ -1,4 +1,4 @@
-import streamlit as st
+ import streamlit as st
 import whisper
 import subprocess
 import os
