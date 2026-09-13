@@ -18,6 +18,8 @@ DEFAULT_STYLE = {
 
 ALIGNMENT_MAP = {"bottom": 2, "middle": 5, "top": 8}
 FONT_SIZE_MAP = {"small": 18, "medium": 24, "large": 32}
+FLOAT_FONT_SIZE_MAP = {"small": 32, "medium": 48, "large": 64}
+FLOAT_POSITIONS = [0.38, 0.5, 0.62]  # fractions of frame height, cycled per phrase
 
 
 @st.cache_resource
@@ -41,6 +43,14 @@ def format_srt_timestamp(seconds: float) -> str:
     return f"{hrs:02}:{mins:02}:{secs:02},{ms:03}"
 
 
+def format_ass_timestamp(seconds: float) -> str:
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    cs = int((seconds - int(seconds)) * 100)
+    return f"{hrs}:{mins:02}:{secs:02}.{cs:02}"
+
+
 def transcribe_words(model, video_path: str):
     result = model.transcribe(video_path, word_timestamps=True)
     words = []
@@ -60,6 +70,31 @@ def words_to_srt(words) -> str:
         end = format_srt_timestamp(w["end"])
         lines.append(f"{idx}\n{start} --> {end}\n{w['word']}\n")
     return "\n".join(lines)
+
+
+def group_words_into_phrases(words, max_words=3, max_gap=0.4):
+    phrases, current = [], []
+    for w in words:
+        if current and (w["start"] - current[-1]["end"] > max_gap or len(current) >= max_words):
+            phrases.append(current)
+            current = []
+        current.append(w)
+    if current:
+        phrases.append(current)
+    return [
+        {"text": " ".join(x["word"] for x in grp), "start": grp[0]["start"], "end": grp[-1]["end"]}
+        for grp in phrases
+    ]
+
+
+def get_video_resolution(video_path: str):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", video_path],
+        check=True, capture_output=True, text=True,
+    )
+    w, h = result.stdout.strip().split(",")
+    return int(w), int(h)
 
 
 def extract_frame(video_path: str, out_path: str, at_seconds: float = 1.0):
@@ -104,19 +139,64 @@ def analyze_reference_style(api_key: str, frame_path: str) -> dict:
     return style
 
 
-def burn_captions(video_path: str, srt_path: str, output_path: str, style: dict):
+def burn_classic(video_path: str, srt_path: str, output_path: str, style: dict):
     alignment = ALIGNMENT_MAP.get(style["position"], 2)
     font_size = FONT_SIZE_MAP.get(style["font_size"], 24)
     primary = hex_to_ass_color(style["text_color"])
     outline = hex_to_ass_color(style["outline_color"])
 
     force_style = (
-        f"FontName=Arial,FontSize={font_size},PrimaryColour={primary},"
+        f"FontName=DejaVu Sans,FontSize={font_size},PrimaryColour={primary},"
         f"OutlineColour={outline},BorderStyle=1,Outline=2,Alignment={alignment}"
     )
     cmd = [
         "ffmpeg", "-y", "-i", video_path,
         "-vf", f"subtitles={srt_path}:force_style='{force_style}'",
+        "-c:a", "copy", output_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def build_floating_ass(phrases, video_w, video_h, style: dict) -> str:
+    primary = hex_to_ass_color(style["text_color"])
+    outline = hex_to_ass_color(style["outline_color"])
+    font_size = FLOAT_FONT_SIZE_MAP.get(style["font_size"], 48)
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {video_w}
+PlayResY: {video_h}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,DejaVu Sans,{font_size},{primary},{primary},{outline},&H00000000,-1,0,0,0,100,100,0,0,1,3,0,5,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    lines = [header]
+    for i, p in enumerate(phrases):
+        y_frac = FLOAT_POSITIONS[i % len(FLOAT_POSITIONS)]
+        x = video_w // 2
+        y = int(video_h * y_frac)
+        start = format_ass_timestamp(p["start"])
+        end = format_ass_timestamp(p["end"])
+        text = p["text"].replace("\n", " ")
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{{\\an5\\pos({x},{y})}}{text}\n")
+    return "".join(lines)
+
+
+def burn_floating(video_path: str, words, output_path: str, style: dict, ass_path: str):
+    video_w, video_h = get_video_resolution(video_path)
+    phrases = group_words_into_phrases(words)
+    ass_content = build_floating_ass(phrases, video_w, video_h, style)
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(ass_content)
+
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vf", f"subtitles={ass_path}",
         "-c:a", "copy", output_path,
     ]
     subprocess.run(cmd, check=True, capture_output=True)
@@ -159,11 +239,18 @@ if reference_video is not None and st.button("Analyze reference style"):
             except Exception as e:
                 st.error(f"Couldn't analyze the reference video: {e}")
 
+st.subheader("Caption layout")
+layout_mode = st.radio(
+    "How should captions appear?",
+    ["Classic (fixed position, word-by-word)", "Floating phrases (bold, centered, shifts position)"],
+    index=1,
+)
+
 st.subheader("Caption style")
 s = st.session_state.style
 c1, c2, c3 = st.columns(3)
 with c1:
-    s["position"] = st.selectbox("Position", ["bottom", "middle", "top"],
+    s["position"] = st.selectbox("Position (classic mode only)", ["bottom", "middle", "top"],
                                   index=["bottom", "middle", "top"].index(s["position"]))
     s["font_size"] = st.selectbox("Font size", ["small", "medium", "large"],
                                    index=["small", "medium", "large"].index(s["font_size"]))
@@ -209,13 +296,17 @@ if st.session_state.words:
             with open(video_path, "wb") as f:
                 f.write(st.session_state["main_video_bytes"])
 
-            srt_path = os.path.join(tmp, "captions.srt")
-            with open(srt_path, "w", encoding="utf-8") as f:
-                f.write(words_to_srt(edited))
-
             output_path = os.path.join(tmp, "output.mp4")
+
             with st.spinner("Burning captions onto video..."):
-                burn_captions(video_path, srt_path, output_path, st.session_state.style)
+                if layout_mode.startswith("Classic"):
+                    srt_path = os.path.join(tmp, "captions.srt")
+                    with open(srt_path, "w", encoding="utf-8") as f:
+                        f.write(words_to_srt(edited))
+                    burn_classic(video_path, srt_path, output_path, st.session_state.style)
+                else:
+                    ass_path = os.path.join(tmp, "captions.ass")
+                    burn_floating(video_path, edited, output_path, st.session_state.style, ass_path)
 
             with open(output_path, "rb") as f:
                 video_bytes = f.read()
@@ -228,5 +319,4 @@ if st.session_state.words:
                 file_name="captioned_video.mp4",
                 mime="video/mp4",
             ) 
-             
- 
+   
